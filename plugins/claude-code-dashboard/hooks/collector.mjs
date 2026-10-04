@@ -23,6 +23,10 @@ import { execSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
+import {
+  USAGE_METHOD, classifyTool,
+  createTranscriptStats, addTranscriptEntry, summarizeTranscriptStats,
+} from "./transcript-stats.mjs";
 
 // ── Configuration ──────────────────────────────────────────────────────────
 
@@ -60,25 +64,6 @@ function loadEnvFallback(key) {
 
 const INGEST_URL = loadEnvFallback("CLAUDE_DASH_INGEST_URL");
 const INGEST_API_KEY = loadEnvFallback("CLAUDE_DASH_API_KEY");
-
-// Built-in tools — everything else is potentially MCP or custom
-const BUILTIN_TOOLS = new Set([
-  "Read", "Write", "Edit", "MultiEdit",
-  "Bash", "Glob", "Grep",
-  "Agent", "Task",
-  "Skill",
-  "ToolSearch",
-  "WebFetch", "WebSearch",
-  "NotebookEdit",
-  "AskUserQuestion",
-  "TodoRead", "TodoWrite",
-  "CronCreate", "CronDelete", "CronList",
-  "EnterPlanMode", "ExitPlanMode",
-  "EnterWorktree", "ExitWorktree",
-  "TaskCreate", "TaskGet", "TaskList", "TaskOutput", "TaskStop", "TaskUpdate",
-  "Config",
-  "SendMessage",
-]);
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -146,24 +131,6 @@ function getUserEmail() {
 
   // 4. OS username (fallback)
   return process.env.USER || "unknown";
-}
-
-function classifyTool(toolName, toolInput) {
-  if (toolName === "Skill") {
-    return { event_type: "skill", event_name: toolInput?.skill || "unknown" };
-  }
-  if (toolName === "Agent" || toolName === "Task") {
-    return {
-      event_type: "subagent",
-      event_name: toolInput?.subagent_type || "general-purpose",
-      event_detail: toolInput?.description || "",
-    };
-  }
-  if (BUILTIN_TOOLS.has(toolName)) {
-    return { event_type: "builtin_tool", event_name: toolName };
-  }
-  // Unknown → possibly MCP, stored separately
-  return { event_type: "unknown_external", event_name: toolName };
 }
 
 // ── stdin reading ───────────────────────────────────────────────────────────
@@ -350,15 +317,7 @@ async function parseTranscript(transcriptPath, sessionId, cwd) {
   const workspace = extractWorkspace(cwd);
   const now = new Date().toISOString();
 
-  let totalInputTokens = 0;
-  let totalOutputTokens = 0;
-  let totalCacheReadTokens = 0;
-  let totalCacheCreationTokens = 0;
-  let messageCount = 0;
-  let model = "unknown";
-  let ccVersion = "unknown";
-  const toolCounts = new Map(); // "type:name" → count
-
+  const stats = createTranscriptStats();
   const rl = createInterface({
     input: createReadStream(transcriptPath, { encoding: "utf-8" }),
     crlfDelay: Infinity,
@@ -368,33 +327,14 @@ async function parseTranscript(transcriptPath, sessionId, cwd) {
     if (!line.trim()) continue;
     let entry;
     try { entry = JSON.parse(line); } catch { continue; }
-
-    if (entry.version) ccVersion = entry.version;
-    if (entry.type !== "assistant" || !entry.message) continue;
-
-    const msg = entry.message;
-    if (msg.model) model = msg.model;
-
-    if (msg.usage) {
-      totalInputTokens += msg.usage.input_tokens || 0;
-      totalOutputTokens += msg.usage.output_tokens || 0;
-      totalCacheReadTokens += msg.usage.cache_read_input_tokens || 0;
-      totalCacheCreationTokens += msg.usage.cache_creation_input_tokens || 0;
-    }
-
-    messageCount++;
-
-    if (Array.isArray(msg.content)) {
-      for (const block of msg.content) {
-        if (block.type !== "tool_use") continue;
-        const c = classifyTool(block.name, block.input);
-        const key = `${c.event_type}:${c.event_name}`;
-        toolCounts.set(key, (toolCounts.get(key) || 0) + 1);
-      }
-    }
+    addTranscriptEntry(stats, entry);
   }
 
-  const base = { session_id: sessionId, user_email: userEmail, timestamp: now, model, cwd, workspace, claude_code_version: ccVersion };
+  const summary = summarizeTranscriptStats(stats);
+  const base = {
+    session_id: sessionId, user_email: userEmail, timestamp: now,
+    model: summary.model, cwd, workspace, claude_code_version: summary.claude_code_version,
+  };
 
   const events = [];
 
@@ -404,16 +344,17 @@ async function parseTranscript(transcriptPath, sessionId, cwd) {
     event_id: randomUUID(),
     event_type: "session_summary",
     event_name: "session",
-    input_tokens: totalInputTokens,
-    output_tokens: totalOutputTokens,
-    cache_read_tokens: totalCacheReadTokens,
-    cache_creation_tokens: totalCacheCreationTokens,
-    message_count: messageCount,
+    event_detail: USAGE_METHOD,
+    input_tokens: summary.input_tokens,
+    output_tokens: summary.output_tokens,
+    cache_read_tokens: summary.cache_read_tokens,
+    cache_creation_tokens: summary.cache_creation_tokens,
+    message_count: summary.message_count,
     count: 1,
   });
 
   // Per-tool counts
-  for (const [key, count] of toolCounts) {
+  for (const [key, count] of summary.toolCounts) {
     const [eventType, eventName] = key.split(":");
     events.push({
       ...base,
