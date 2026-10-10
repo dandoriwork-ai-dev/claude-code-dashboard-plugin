@@ -24,7 +24,7 @@ import { randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 import {
-  USAGE_METHOD, classifyTool,
+  USAGE_METHOD, classifyTool, classifyToolKind,
   createTranscriptStats, addTranscriptEntry, summarizeTranscriptStats,
 } from "./transcript-stats.mjs";
 
@@ -314,7 +314,6 @@ async function parseTranscript(transcriptPath, sessionId, cwd) {
   if (!transcriptPath || !existsSync(transcriptPath)) return [];
 
   const userEmail = getUserEmail();
-  const workspace = extractWorkspace(cwd);
   const now = new Date().toISOString();
 
   const stats = createTranscriptStats();
@@ -331,9 +330,14 @@ async function parseTranscript(transcriptPath, sessionId, cwd) {
   }
 
   const summary = summarizeTranscriptStats(stats);
+  // 送る行のフォルダ＝直近の指示の中で一番ツールを使ったフォルダ（v0.6.0）。
+  // 応答が終わった時点の cwd だと、最後に別フォルダへ移った指示の作業がまるごとそちらに付いた
+  // （10/10 社長の実測: 30 日 240 セッション中 90 で PJ がずれる → この方式で 12）。
+  const labelCwd = summary.turnCwd || cwd;
   const base = {
     session_id: sessionId, user_email: userEmail, timestamp: now,
-    model: summary.model, cwd, workspace, claude_code_version: summary.claude_code_version,
+    model: summary.model, cwd: labelCwd, workspace: extractWorkspace(labelCwd),
+    claude_code_version: summary.claude_code_version,
   };
 
   const events = [];
@@ -351,16 +355,18 @@ async function parseTranscript(transcriptPath, sessionId, cwd) {
     cache_creation_tokens: summary.cache_creation_tokens,
     message_count: summary.message_count,
     count: 1,
+    ...(summary.prompt_count !== null && { prompt_count: summary.prompt_count }),
+    ...(summary.effort && { effort: summary.effort }),
   });
 
-  // Per-tool counts
-  for (const [key, count] of summary.toolCounts) {
-    const [eventType, eventName] = key.split(":");
+  // Per-tool counts（種別ごとの累計。同じ Bash でも「確かめる」と「その他」は別の行）
+  for (const { event_type: eventType, event_name: eventName, tool_kind: toolKind, count } of summary.toolCounts.values()) {
     events.push({
       ...base,
       event_id: randomUUID(),
       event_type: eventType,
       event_name: eventName,
+      tool_kind: toolKind,
       input_tokens: 0,
       output_tokens: 0,
       cache_read_tokens: 0,
@@ -391,7 +397,7 @@ async function handlePostToolUse(input) {
     timestamp: new Date().toISOString(),
     event_type: classified.event_type,
     event_name: classified.event_name,
-    event_detail: classified.event_detail || "",
+    tool_kind: classifyToolKind(toolName, toolInput),
     model: "unknown",
     input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0,
     message_count: 0, count: 1,
