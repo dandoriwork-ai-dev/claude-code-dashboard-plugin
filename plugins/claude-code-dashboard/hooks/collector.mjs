@@ -329,10 +329,11 @@ async function parseTranscript(transcriptPath, sessionId, cwd) {
     addTranscriptEntry(stats, entry);
   }
 
-  const summary = summarizeTranscriptStats(stats);
-  // 送る行のフォルダ＝直近の指示の中で一番ツールを使ったフォルダ（v0.6.0）。
+  const summary = summarizeTranscriptStats(stats, { home: homedir() });
+  // 送る行のフォルダ＝直近の指示の中心（v0.6.0＝一番ツールを使ったフォルダ）。
   // 応答が終わった時点の cwd だと、最後に別フォルダへ移った指示の作業がまるごとそちらに付いた
   // （10/10 社長の実測: 30 日 240 セッション中 90 で PJ がずれる → この方式で 12）。
+  // v0.7.0＝ホーム・記憶ファイル等にいたまま、または今いるフォルダの外のファイルを読み書きした指示は、そのファイルのフォルダ（chooseTurnFolder）。
   const labelCwd = summary.turnCwd || cwd;
   const base = {
     session_id: sessionId, user_email: userEmail, timestamp: now,

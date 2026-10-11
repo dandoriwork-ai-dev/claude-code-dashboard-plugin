@@ -5,6 +5,8 @@
  * summarizeTranscriptStats で session_summary とツール別回数の元データを得る。
  */
 
+import { posix, win32 } from "node:path";
+
 // ── 集計方式の版 ─────────────────────────────────────────────────────────────
 // 1回のAPI応答は、トランスクリプトに content block ごとの複数行（思考・本文・tool_use）
 // として書かれ、各行が同じ usage（応答全体の確定値）を持つ。行ごとに足すと応答あたり
@@ -109,6 +111,7 @@ export function createTranscriptStats() {
     promptCount: 0,
     effortByMessage: new Map(), // 応答キー → effort
     turnCwdCounts: new Map(),   // 直近の人の発話以降に、どのフォルダでツールを使ったか
+    turnTouchCounts: new Map(), // 直近の人の発話以降に、どのフォルダのファイルを読み書きしたか（v0.7.0）
   };
 }
 
@@ -119,6 +122,7 @@ export function addTranscriptEntry(stats, entry) {
   if (isHumanPrompt(entry)) {
     if (entry.origin?.kind === "human") stats.promptCount++;
     stats.turnCwdCounts = new Map(); // 人の発話＝ここから新しい指示
+    stats.turnTouchCounts = new Map();
   }
   if (entry.type !== "assistant" || !entry.message) return;
 
@@ -154,7 +158,56 @@ export function addTranscriptEntry(stats, entry) {
     if (typeof entry.cwd === "string" && entry.cwd) {
       stats.turnCwdCounts.set(entry.cwd, (stats.turnCwdCounts.get(entry.cwd) || 0) + 1);
     }
+    const folder = touchedFolder(block.name, block.input);
+    if (folder) stats.turnTouchCounts.set(folder, (stats.turnTouchCounts.get(folder) || 0) + 1);
   }
+}
+
+// ── 指示ごとのフォルダ（v0.7.0・2026-10-11）─────────────────────────────────
+// シェルの今いる場所（cwd）は「最後に cd した先」で、作業の場所とは限らない。ホームや記憶ファイルのフォルダに
+// いたまま絶対パスで案件のファイルを読み書きする使い方だと、案件が分からない（佐藤さん 30 日で 42%・10/11 実測）。
+// → Claude が読み書きしたファイルのフォルダを手がかりにする。送るのはフォルダのパスだけ（ファイル名・本文は送らない）。
+const PATH_INPUT = { Read: "file_path", Edit: "file_path", Write: "file_path", MultiEdit: "file_path", NotebookEdit: "notebook_path", Glob: "path", Grep: "path" };
+const DIR_INPUT = new Set(["Glob", "Grep"]); // path がフォルダそのもの
+// 置き場所（記憶ファイル・設定・一時フォルダ）は案件の手がかりにならないので数えない
+const NOT_A_PLACE = [/\/\.claude\//, /^\/(private\/)?tmp\//, /^\/(private\/)?var\/folders\//, /\/AppData\/Local\/Temp\//i];
+
+/** 道具の入力から「触ったフォルダ」を返す。数えないもの（相対パス・置き場所・パスを持たない道具）は null */
+export function touchedFolder(toolName, toolInput) {
+  const key = PATH_INPUT[toolName];
+  const p = key ? toolInput?.[key] : undefined;
+  if (typeof p !== "string" || !p) return null;
+  const windows = /^[A-Za-z]:[\\/]/.test(p);
+  if (!windows && !p.startsWith("/")) return null;
+  const folder = DIR_INPUT.has(toolName) ? p : (windows ? win32 : posix).dirname(p);
+  const normalized = folder.replace(/\\/g, "/") + "/";
+  if (NOT_A_PLACE.some((re) => re.test(normalized))) return null;
+  return folder;
+}
+
+// 比べるときだけ区切りを / に・Windows は大文字小文字を区別しない
+const comparable = (p) => {
+  const s = p.replace(/\\/g, "/").replace(/\/+$/, "");
+  return /^[A-Za-z]:\//.test(s) ? s.toLowerCase() : s;
+};
+const isInside = (child, parent) => (comparable(child) + "/").startsWith(comparable(parent) + "/");
+// 入れ物＝案件を入れておく場所（ホーム・デスクトップ・ダウンロード等）と置き場所（記憶ファイル・一時フォルダ）。
+// ここにいたまま作業すると、シェルの居場所からは案件が分からない
+const CONTAINERS = ["", "Desktop", "Downloads", "Documents", "OneDrive/Desktop", "OneDrive/Documents", "OneDrive/デスクトップ", "Desktop/デスクトップ"];
+const isContainer = (cwd, home) =>
+  (home && CONTAINERS.some((c) => comparable(cwd) === comparable(c ? `${home}/${c}` : home)))
+  || NOT_A_PLACE.some((re) => re.test(cwd.replace(/\\/g, "/") + "/"));
+
+/**
+ * 指示のフォルダを決める（v0.7.0）。cwd＝一番ツールを使ったシェルの居場所・touched＝一番読み書きしたファイルのフォルダ。
+ * 案件フォルダの中を触った指示は今まで通り cwd（深いフォルダにすると、git でない案件では workspace が奥の名前になり規則が外れる）。
+ * 変えるのは ①入れ物にいたまま作業した ②今いるフォルダの外を触った、のときだけ
+ */
+export function chooseTurnFolder(cwd, touched, home) {
+  if (!touched) return cwd;
+  if (!cwd) return touched;
+  if (isContainer(cwd, home)) return touched;
+  return isInside(touched, cwd) ? cwd : touched;
 }
 
 // 人が打った指示か。origin（2.1.258 以降）があればそれだけで判定する。
@@ -176,7 +229,9 @@ const mostFrequent = (values) => {
   return best;
 };
 
-export function summarizeTranscriptStats(stats) {
+const mostUsed = (counts) => [...counts.entries()].reduce((a, b) => (b[1] > a[1] ? b : a), [null, 0])[0];
+
+export function summarizeTranscriptStats(stats, { home } = {}) {
   const tokens = Object.fromEntries(Object.values(USAGE_FIELDS).map((col) => [col, 0]));
   for (const usage of stats.usageByMessage.values()) {
     for (const [field, col] of Object.entries(USAGE_FIELDS)) tokens[col] += usage[field] || 0;
@@ -191,7 +246,8 @@ export function summarizeTranscriptStats(stats) {
     prompt_count: stats.hasOrigin ? stats.promptCount : null,
     // 応答ごとの effort で一番多かったもの。無ければ null
     effort: mostFrequent(stats.effortByMessage.values()),
-    // 直近の指示の中で一番ツールを使ったフォルダ（同数なら先に使った方）。無ければ null＝呼び出し側の cwd を使う
-    turnCwd: [...stats.turnCwdCounts.entries()].reduce((a, b) => (b[1] > a[1] ? b : a), [null, 0])[0],
+    // 直近の指示のフォルダ（v0.7.0）＝chooseTurnFolder。ファイルに触っていない指示は一番ツールを使った cwd（v0.6.0 と同じ）。
+    // 同数なら先に使った方。どちらも無ければ null＝呼び出し側の cwd を使う
+    turnCwd: chooseTurnFolder(mostUsed(stats.turnCwdCounts), mostUsed(stats.turnTouchCounts), home),
   };
 }
