@@ -98,7 +98,12 @@ const USAGE_FIELDS = {
   cache_creation_input_tokens: "cache_creation_tokens",
 };
 
-export function createTranscriptStats() {
+/**
+ * pathKind（任意）＝Glob/Grep の path がファイルかフォルダかを実物で確かめる関数（p → "file" | "dir" | null）。
+ * I/O なので collector が渡す。同じパスは 1 回だけ確かめる
+ */
+export function createTranscriptStats({ pathKind } = {}) {
+  const kinds = new Map();
   return {
     usageByMessage: new Map(), // 応答キー → { usage キー: 最大値 }
     unkeyedEntries: 0,         // 応答を特定できない行の通し番号
@@ -112,6 +117,7 @@ export function createTranscriptStats() {
     effortByMessage: new Map(), // 応答キー → effort
     turnCwdCounts: new Map(),   // 直近の人の発話以降に、どのフォルダでツールを使ったか
     turnTouchCounts: new Map(), // 直近の人の発話以降に、どのフォルダのファイルを読み書きしたか（v0.7.0）
+    pathKind: pathKind ? (p) => { if (!kinds.has(p)) kinds.set(p, pathKind(p)); return kinds.get(p); } : null,
   };
 }
 
@@ -158,7 +164,7 @@ export function addTranscriptEntry(stats, entry) {
     if (typeof entry.cwd === "string" && entry.cwd) {
       stats.turnCwdCounts.set(entry.cwd, (stats.turnCwdCounts.get(entry.cwd) || 0) + 1);
     }
-    const folder = touchedFolder(block.name, block.input);
+    const folder = touchedFolder(block.name, block.input, stats.pathKind);
     if (folder) stats.turnTouchCounts.set(folder, (stats.turnTouchCounts.get(folder) || 0) + 1);
   }
 }
@@ -168,18 +174,26 @@ export function addTranscriptEntry(stats, entry) {
 // いたまま絶対パスで案件のファイルを読み書きする使い方だと、案件が分からない（佐藤さん 30 日で 42%・10/11 実測）。
 // → Claude が読み書きしたファイルのフォルダを手がかりにする。送るのはフォルダのパスだけ（ファイル名・本文は送らない）。
 const PATH_INPUT = { Read: "file_path", Edit: "file_path", Write: "file_path", MultiEdit: "file_path", NotebookEdit: "notebook_path", Glob: "path", Grep: "path" };
-const DIR_INPUT = new Set(["Glob", "Grep"]); // path がフォルダそのもの
+const DIR_INPUT = new Set(["Glob", "Grep"]); // path はフォルダのことが多いが、Grep はファイル 1 つも指せる
 // 置き場所（記憶ファイル・設定・一時フォルダ）は案件の手がかりにならないので数えない
 const NOT_A_PLACE = [/\/\.claude\//, /^\/(private\/)?tmp\//, /^\/(private\/)?var\/folders\//, /\/AppData\/Local\/Temp\//i];
 
-/** 道具の入力から「触ったフォルダ」を返す。数えないもの（相対パス・置き場所・パスを持たない道具）は null */
-export function touchedFolder(toolName, toolInput) {
+/**
+ * 道具の入力から「触ったフォルダ」を返す。数えないもの（相対パス・置き場所・パスを持たない道具）は null。
+ * Glob/Grep の path は pathKind で実物を確かめる＝ファイルならその親・見つからなければ数えない（v0.8.0。
+ * v0.7.0 は path をそのままフォルダにしていたので、Grep でファイルを指すと workspace がファイル名になった・浦谷さん 10/11）。
+ * pathKind が無ければ path そのもの
+ */
+export function touchedFolder(toolName, toolInput, pathKind) {
   const key = PATH_INPUT[toolName];
   const p = key ? toolInput?.[key] : undefined;
   if (typeof p !== "string" || !p) return null;
   const windows = /^[A-Za-z]:[\\/]/.test(p);
   if (!windows && !p.startsWith("/")) return null;
-  const folder = DIR_INPUT.has(toolName) ? p : (windows ? win32 : posix).dirname(p);
+  const parent = (windows ? win32 : posix).dirname(p);
+  const kind = !DIR_INPUT.has(toolName) ? "file" : pathKind ? pathKind(p) : "dir";
+  if (kind !== "file" && kind !== "dir") return null;
+  const folder = kind === "file" ? parent : p;
   const normalized = folder.replace(/\\/g, "/") + "/";
   if (NOT_A_PLACE.some((re) => re.test(normalized))) return null;
   return folder;
@@ -231,6 +245,11 @@ const mostFrequent = (values) => {
 
 const mostUsed = (counts) => [...counts.entries()].reduce((a, b) => (b[1] > a[1] ? b : a), [null, 0])[0];
 
+/** 指示のフォルダ＝一番ツールを使った cwd と一番読み書きしたフォルダから chooseTurnFolder で決める（Codex の収集も同じ決め方を使う） */
+export function turnFolderOf(cwdCounts, touchCounts, home) {
+  return chooseTurnFolder(mostUsed(cwdCounts), mostUsed(touchCounts), home);
+}
+
 export function summarizeTranscriptStats(stats, { home } = {}) {
   const tokens = Object.fromEntries(Object.values(USAGE_FIELDS).map((col) => [col, 0]));
   for (const usage of stats.usageByMessage.values()) {
@@ -248,6 +267,6 @@ export function summarizeTranscriptStats(stats, { home } = {}) {
     effort: mostFrequent(stats.effortByMessage.values()),
     // 直近の指示のフォルダ（v0.7.0）＝chooseTurnFolder。ファイルに触っていない指示は一番ツールを使った cwd（v0.6.0 と同じ）。
     // 同数なら先に使った方。どちらも無ければ null＝呼び出し側の cwd を使う
-    turnCwd: chooseTurnFolder(mostUsed(stats.turnCwdCounts), mostUsed(stats.turnTouchCounts), home),
+    turnCwd: turnFolderOf(stats.turnCwdCounts, stats.turnTouchCounts, home),
   };
 }

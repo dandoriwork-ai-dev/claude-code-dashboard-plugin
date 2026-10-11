@@ -47,17 +47,20 @@ git clone git@github.com:your-org/your-repo.git
 1. **PostToolUse hook**: 各ツール使用時にイベントをローカルファイルにバッファ
 2. **Stop hook**: セッション終了時にトランスクリプトを解析し、Ingest API へ一括送信
 3. 送信失敗時は次回セッション終了時に自動リトライ
+4. **Codex（v0.8.0〜）**: この PC で Codex（OpenAI）を使っていれば、Stop のときに `~/.codex/sessions` の記録も読んで同じ形で送る（10 分に 1 回まで・裏で動くので Claude Code は待たない・2026-06-26 より前の分は送らない）。送った位置は `~/.claude/claude-dash/codex-state.json`
 
 ### What is collected (metadata only)
 
 - ツール種別・名前・回数（Skill, Subagent, external tools）
 - モデル名、トークン数
-- セッションID、ワークスペース名
+- セッションID、作業フォルダのパスとワークスペース名
+- Codex（v0.8.0〜）も同じ項目（tool=codex）：モデル名・トークン数・指示の数・道具の種別と回数・作業フォルダのパス
 - ユーザーメール（git config）
 
 ### What is NOT collected
 
-- 会話内容（プロンプト / 回答テキスト）
+- 会話内容（プロンプト / 回答テキスト）※Codex も同じ
+- コマンドの本文・ファイル名
 - ファイル内容
 - 個人情報
 
