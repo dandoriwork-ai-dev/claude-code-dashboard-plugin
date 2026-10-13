@@ -300,7 +300,11 @@ function pushSnapshot(stats, timestamp) {
   const sig = (s) => JSON.stringify([s.input_tokens, s.cache_read_tokens, s.cache_creation_tokens, s.output_tokens, s.message_count, s.prompt_count, s.turn_count, s.tools]);
   const last = stats.snapshots[stats.snapshots.length - 1];
   if (last && sig(last) === sig(snap)) return; // 何も増えていない
-  stats.snapshots.push(snap);
+  // 同じ時刻（同じミリ秒）に終わった指示が続いたら、最後の累計 1 つにまとめる（v0.8.1）。
+  // 行の id は時刻から作るので、2 つ送ると同じ id で別の累計が入り、画面がどちらを最終値に拾うかも決まらなかった
+  // （10/11 北原さんの 7/31 のセッション＝14 時刻・重複 25 行）
+  if (last && last.timestamp === snap.timestamp) stats.snapshots[stats.snapshots.length - 1] = snap;
+  else stats.snapshots.push(snap);
 }
 
 /**
@@ -343,7 +347,7 @@ export function stableEventId(...parts) {
  * スナップショット 1 つ → Ingest に送る行（session_summary 1 行＋道具の系列ごとの累計）。
  * 形は Claude Code の collector と同じ。workspaceOf はフォルダ → workspace 名（git のルート名）
  */
-export function snapshotEvents(snap, { sessionId, userEmail, cliVersion, accountId, workspaceOf }) {
+export function snapshotEvents(snap, { sessionId, userEmail, cliVersion, accountId, pluginVersion, workspaceOf }) {
   const cwd = snap.folder || null;
   const base = {
     session_id: sessionId, user_email: userEmail, timestamp: snap.timestamp,
@@ -351,6 +355,7 @@ export function snapshotEvents(snap, { sessionId, userEmail, cliVersion, account
     tool: CODEX_TOOL, source: CODEX_SOURCE,
     ...(cliVersion && { client_version: cliVersion }),
     ...(accountId && { account_id: accountId }),
+    ...(pluginVersion && { plugin_version: pluginVersion }),
   };
   const id = (type, name, kind) => stableEventId(CODEX_TOOL, sessionId, snap.timestamp, type, name, kind || "");
   const events = [{

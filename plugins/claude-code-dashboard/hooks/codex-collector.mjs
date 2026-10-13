@@ -33,6 +33,7 @@ import {
   DASH_DIR, ensureDirs, logError, extractWorkspace, getUserEmail, codexHome,
   saveFailedEvents, sendEvents,
 } from "./shared-io.mjs";
+import { PLUGIN_VERSION } from "./plugin-version.mjs";
 
 const STATE_FILE = join(DASH_DIR, "codex-state.json");
 const LOCK_FILE = join(DASH_DIR, "codex-collector.lock");
@@ -148,7 +149,7 @@ export async function collect(state, { cutoff = CODEX_CUTOFF } = {}) {
     if (!chosen.length) continue;
     for (const snap of chosen) {
       events.push(...snapshotEvents(snap, {
-        sessionId: stats.sessionId, userEmail, cliVersion: stats.cliVersion, accountId: stats.accountId, workspaceOf,
+        sessionId: stats.sessionId, userEmail, cliVersion: stats.cliVersion, accountId: stats.accountId, pluginVersion: PLUGIN_VERSION, workspaceOf,
       }));
     }
     sessionUpdates[stats.sessionId] = { sent_until: chosen[chosen.length - 1].timestamp };

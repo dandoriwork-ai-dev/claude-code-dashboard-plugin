@@ -29,6 +29,7 @@ import {
   DASH_DIR, ensureDirs, logError, extractWorkspace, getUserEmail, codexHome, pathKind,
   saveFailedEvents, loadFailedEvents, sendEvents,
 } from "./shared-io.mjs";
+import { PLUGIN_VERSION } from "./plugin-version.mjs";
 
 // ── Configuration ──────────────────────────────────────────────────────────
 
@@ -106,6 +107,7 @@ async function parseTranscript(transcriptPath, sessionId, cwd) {
     session_id: sessionId, user_email: userEmail, timestamp: now,
     model: summary.model, cwd: labelCwd, workspace: extractWorkspace(labelCwd),
     claude_code_version: summary.claude_code_version,
+    plugin_version: PLUGIN_VERSION,
   };
 
   const events = [];
@@ -188,6 +190,7 @@ async function handlePostToolUse(input) {
     cwd,
     workspace: extractWorkspace(cwd),
     claude_code_version: "unknown",
+    plugin_version: PLUGIN_VERSION,
   };
 
   appendToBuffer(event);
