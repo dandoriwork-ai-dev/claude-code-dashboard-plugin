@@ -4,8 +4,8 @@
  */
 
 import {
-  readFileSync, writeFileSync, appendFileSync,
-  existsSync, mkdirSync, unlinkSync, readdirSync, statSync,
+  readFileSync, writeFileSync, appendFileSync, renameSync,
+  existsSync, mkdirSync, unlinkSync, readdirSync, statSync, openSync, closeSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -76,6 +76,52 @@ export function logError(context, err) {
     appendFileSync(ERROR_LOG, msg, "utf-8");
   } catch {
     // swallow
+  }
+}
+
+/** 書きかけを残さずに JSON を保存する（一時ファイル→rename） */
+export function writeJsonAtomic(file, value) {
+  const tmp = `${file}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify(value), "utf-8");
+  renameSync(tmp, file);
+}
+
+/**
+ * 同時に 2 つ動かないためのロック（Claude Code のセッションが複数あると Stop が重なる）。取れなければ null。
+ * 落ちたプロセスのロックだけを外す（時間で判断。動いている収集は staleMs もかからない）。
+ */
+export function acquireLock(file, staleMs = 30 * 60 * 1000) {
+  ensureDirs();
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = openSync(file, "wx");
+      writeFileSync(fd, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+      return fd;
+    } catch (err) {
+      if (err.code !== "EEXIST") throw err;
+      try {
+        if (Date.now() - statSync(file).mtimeMs > staleMs) { unlinkSync(file); continue; }
+      } catch { continue; }
+      return null;
+    }
+  }
+  return null;
+}
+
+export function releaseLock(file, fd) {
+  try { closeSync(fd); } catch { /* ignore */ }
+  try { unlinkSync(file); } catch { /* ignore */ }
+}
+
+/** git のリポジトリの根（無ければ null）。資産の収集がリポジトリの CLAUDE.md／AGENTS.md を探すのに使う */
+export function gitRoot(cwd) {
+  try {
+    const root = execSync("git rev-parse --show-toplevel", {
+      encoding: "utf-8", timeout: 3000, cwd: resolve(cwd), stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
+    return root || null;
+  } catch {
+    return null;
   }
 }
 
@@ -268,4 +314,81 @@ export async function sendEvents(events) {
     if (requeue.length) leftover.push(...requeue);
   }
   return leftover;
+}
+
+// ── ナレッジの受け口（/v1/knowledge/status・/v1/assets・/v1/notes） ─────────────────
+// raw_events（/api/ingest）とは別の口。URL は CLAUDE_DASH_INGEST_URL と同じ Ingest の別パス。
+
+/** 受け口の URL（未設定なら null） */
+export function knowledgeUrl(path, base = INGEST_URL) {
+  if (!base) return null;
+  try { return new URL(path, base).href; } catch { return null; }
+}
+
+/**
+ * 受け口が開いているか（告知を出した後か）と、行に入れる告知の版。
+ * 返す: { open: true, consent_ver } ／ { open: false }（閉じている・古い Ingest で口が無い＝404 も閉じている扱い）／ null（届かない・未設定）
+ */
+export async function fetchKnowledgeStatus({ fetchImpl = fetch, base = INGEST_URL, apiKey = INGEST_API_KEY } = {}) {
+  const url = knowledgeUrl("/v1/knowledge/status", base);
+  if (!url || !apiKey) return null;
+  try {
+    const res = await fetchImpl(url, { headers: { Authorization: `Bearer ${apiKey}` }, signal: AbortSignal.timeout(10_000) });
+    if (res.status === 404) return { open: false };
+    if (!res.ok) return null;
+    const body = await res.json();
+    if (body && body.open === true && typeof body.consent_ver === "string" && /^[A-Za-z0-9._-]{1,64}$/.test(body.consent_ver)) {
+      return { open: true, consent_ver: body.consent_ver };
+    }
+    return { open: false };
+  } catch (err) {
+    logError("knowledge-status", err);
+    return null;
+  }
+}
+
+const KNOWLEDGE_REJECT = /^(?:assets|notes) at index (\d+) is invalid: ([\w-]+)$/;
+
+/**
+ * 1 リクエスト（受け口の上限＝20 行）を送る。
+ * 返す: { status: "ok", rejected: Map<index, reason> }（rejected 以外は入った）
+ *      ／ { status: "closed" }（告知の前・閉じた）／ { status: "retry" }（届かない・5xx・429）
+ *      ／ { status: "drop", reason }（本体ごと受けない 4xx＝送り直しても同じ）
+ */
+export async function postKnowledge(kind, rows, { fetchImpl = fetch, base = INGEST_URL, apiKey = INGEST_API_KEY } = {}) {
+  const url = knowledgeUrl(`/v1/${kind}`, base);
+  if (!url || !apiKey) return { status: "retry" };
+  let res;
+  try {
+    res = await fetchImpl(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ [kind]: rows }),
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch (err) {
+    logError("knowledge-post", err);
+    return { status: "retry" };
+  }
+  let body = null;
+  try { body = await res.json(); } catch { /* 本体なし */ }
+  const rejectedOf = (list) => {
+    const m = new Map();
+    for (const line of Array.isArray(list) ? list : []) {
+      const hit = typeof line === "string" ? KNOWLEDGE_REJECT.exec(line) : null;
+      if (hit) m.set(Number(hit[1]), hit[2]);
+    }
+    return m;
+  };
+  if (res.ok) return { status: "ok", rejected: rejectedOf(body?.errors) };
+  if (res.status === 403 && body?.error === "knowledge_closed") return { status: "closed" };
+  if (res.status === 404) return { status: "closed" }; // 受け口がまだ無い Ingest
+  if (res.status === 400 && Array.isArray(body?.details)) {
+    // 全部の行が落ちた＝行ごとの理由がある。理由の無い行も落ちた扱い
+    const rejected = rejectedOf(body.details);
+    rows.forEach((_, i) => { if (!rejected.has(i)) rejected.set(i, "rejected"); });
+    return { status: "ok", rejected };
+  }
+  if (res.status === 429 || res.status >= 500) return { status: "retry" };
+  return { status: "drop", reason: `http_${res.status}` };
 }

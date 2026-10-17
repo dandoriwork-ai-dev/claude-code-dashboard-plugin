@@ -22,6 +22,17 @@
           }
         ]
       }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/collector.mjs session-start",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }

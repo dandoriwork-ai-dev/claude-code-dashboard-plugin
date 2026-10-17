@@ -10,7 +10,10 @@
  *       - トランスクリプト解析が権威データソース（トークン/モデル情報含む）
  *       - バッファは Stop が呼ばれなかった（クラッシュ）セッションの復旧用
  *
- * Privacy: メタデータ/イベント種別のみ収集。会話本文は送信しない。
+ * SessionStart: 仕組みの資産（②）の承認待ちがあれば、本人に 1 行で知らせる（/dash-assets）
+ *
+ * Privacy: このファイルが送るのはメタデータ/イベント種別だけ。会話本文は送信しない。
+ *          仕組みの資産（CLAUDE.md・rules 等）は asset-collector.mjs が、受け口が開いていて本人が承認したものだけを送る。
  */
 
 import { readFileSync, writeFileSync, appendFileSync, existsSync, unlinkSync, statSync } from "node:fs";
@@ -35,10 +38,11 @@ import { PLUGIN_VERSION } from "./plugin-version.mjs";
 
 // CWD_FILTER_PREFIX is no longer used — all directories are tracked.
 const BUFFER_FILE = join(DASH_DIR, "event-buffer.jsonl");
+const HOOKS_DIR = dirname(fileURLToPath(import.meta.url));
 // Codex の収集（v0.8.0）。Stop のたびではなく 10 分に 1 回まで
-const CODEX_COLLECTOR = join(dirname(fileURLToPath(import.meta.url)), "codex-collector.mjs");
-const CODEX_MARKER = join(DASH_DIR, "codex-last-start");
-const CODEX_INTERVAL_MS = 10 * 60 * 1000;
+const CODEX = { script: join(HOOKS_DIR, "codex-collector.mjs"), marker: join(DASH_DIR, "codex-last-start"), intervalMs: 10 * 60 * 1000 };
+// 仕組みの資産（ナレッジ収集・段1）。1 日 1 回まで（設計 §4 ②）
+const ASSETS = { script: join(HOOKS_DIR, "asset-collector.mjs"), marker: join(DASH_DIR, "assets-last-start"), intervalMs: 24 * 60 * 60 * 1000 };
 
 // ── stdin reading ───────────────────────────────────────────────────────────
 
@@ -149,20 +153,23 @@ async function parseTranscript(transcriptPath, sessionId, cwd) {
   return events;
 }
 
-// ── Codex ───────────────────────────────────────────────────────────────────
+// ── 切り離して起こす収集（Codex・仕組みの資産） ───────────────────────────────────
 
-// Codex の記録を集めるプロセスを切り離して起こす（Stop を待たせない・終わりを待たない）。
-// Codex を使っていない PC（~/.codex/sessions が無い）では何もしない
-function startCodexCollector() {
+// 別プロセスを切り離して起こす（Stop を待たせない・終わりを待たない）。前回から intervalMs 経っていなければ何もしない
+function startDetached({ script, marker, intervalMs }, name) {
   try {
-    if (!existsSync(join(codexHome(), "sessions"))) return;
-    if (existsSync(CODEX_MARKER) && Date.now() - statSync(CODEX_MARKER).mtimeMs < CODEX_INTERVAL_MS) return;
+    if (existsSync(marker) && Date.now() - statSync(marker).mtimeMs < intervalMs) return;
     ensureDirs();
-    writeFileSync(CODEX_MARKER, new Date().toISOString(), "utf-8");
-    spawn(process.execPath, [CODEX_COLLECTOR], { detached: true, stdio: "ignore", windowsHide: true }).unref();
+    writeFileSync(marker, new Date().toISOString(), "utf-8");
+    spawn(process.execPath, [script], { detached: true, stdio: "ignore", windowsHide: true }).unref();
   } catch (err) {
-    logError("codex-start", err);
+    logError(`${name}-start`, err);
   }
+}
+
+// Codex を使っていない PC（~/.codex/sessions が無い）では起こさない
+function startCodexCollector() {
+  if (existsSync(join(codexHome(), "sessions"))) startDetached(CODEX, "codex");
 }
 
 // ── Handlers ────────────────────────────────────────────────────────────────
@@ -202,6 +209,11 @@ async function handleStop(input) {
   const transcriptPath = input.transcript_path || "";
 
   startCodexCollector();
+  // 仕組みの資産：リポジトリの CLAUDE.md／AGENTS.md を探すために作業フォルダを覚え（手元だけ）、1 日 1 回集める。
+  // 受け口が閉じている（告知の前）間は、起こされた側が何も読まずに終わる
+  // 資産側は動的に読む＝そちらが壊れていても①（量と型）の送信は止まらない
+  try { (await import("./asset-collector.mjs")).recordCwd(cwd); } catch (err) { logError("assets-cwd", err); }
+  startDetached(ASSETS, "assets");
 
   // 1. Parse transcript (authoritative data with tokens/model)
   const transcriptEvents = await parseTranscript(transcriptPath, sessionId, cwd);
@@ -226,23 +238,26 @@ async function handleStop(input) {
 // ── Entry point ─────────────────────────────────────────────────────────────
 
 async function main() {
-  const mode = process.argv[2]; // "post-tool-use" | "stop"
+  const mode = process.argv[2]; // "post-tool-use" | "stop" | "session-start"
 
+  let output = {};
   try {
     const input = await readStdin();
-    const cwd = input.cwd || "";
 
     if (mode === "post-tool-use") {
       await handlePostToolUse(input);
     } else if (mode === "stop") {
       await handleStop(input);
+    } else if (mode === "session-start") {
+      const assets = await import("./asset-collector.mjs");
+      output = assets.sessionStartOutput(assets.pendingCount());
     }
   } catch (err) {
     logError(mode, err);
   }
 
   // Hooks must always output JSON and exit 0
-  console.log("{}");
+  console.log(JSON.stringify(output));
   process.exit(0);
 }
 

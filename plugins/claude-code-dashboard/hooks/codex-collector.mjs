@@ -18,10 +18,7 @@
  * Privacy: 送るのはメタデータだけ（codex-stats.mjs 参照）。会話・コマンド・ファイルの中身は送らない。
  */
 
-import {
-  readFileSync, writeFileSync, renameSync, existsSync, statSync, readdirSync,
-  openSync, closeSync, unlinkSync, createReadStream,
-} from "node:fs";
+import { readFileSync, writeFileSync, statSync, readdirSync, createReadStream } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -31,13 +28,12 @@ import {
 } from "./codex-stats.mjs";
 import {
   DASH_DIR, ensureDirs, logError, extractWorkspace, getUserEmail, codexHome,
-  saveFailedEvents, sendEvents,
+  saveFailedEvents, sendEvents, writeJsonAtomic, acquireLock, releaseLock,
 } from "./shared-io.mjs";
 import { PLUGIN_VERSION } from "./plugin-version.mjs";
 
 const STATE_FILE = join(DASH_DIR, "codex-state.json");
 const LOCK_FILE = join(DASH_DIR, "codex-collector.lock");
-const LOCK_STALE_MS = 30 * 60 * 1000;
 const STATE_VERSION = 1;
 
 // ── 記録を探す ───────────────────────────────────────────────────────────────
@@ -90,34 +86,7 @@ function loadState() {
 
 function saveState(state) {
   ensureDirs();
-  const tmp = `${STATE_FILE}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(state), "utf-8");
-  renameSync(tmp, STATE_FILE);
-}
-
-/** 同時に 2 つ動かない（Claude Code のセッションが複数あると Stop が重なる）。取れなければ null */
-function acquireLock() {
-  ensureDirs();
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const fd = openSync(LOCK_FILE, "wx");
-      writeFileSync(fd, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
-      return fd;
-    } catch (err) {
-      if (err.code !== "EEXIST") throw err;
-      try {
-        // 落ちたプロセスのロックだけを外す（時間で判断。動いている収集は 30 分もかからない）
-        if (Date.now() - statSync(LOCK_FILE).mtimeMs > LOCK_STALE_MS) { unlinkSync(LOCK_FILE); continue; }
-      } catch { continue; }
-      return null;
-    }
-  }
-  return null;
-}
-
-function releaseLock(fd) {
-  try { closeSync(fd); } catch { /* ignore */ }
-  try { unlinkSync(LOCK_FILE); } catch { /* ignore */ }
+  writeJsonAtomic(STATE_FILE, state);
 }
 
 // ── 本体 ────────────────────────────────────────────────────────────────────
@@ -159,7 +128,7 @@ export async function collect(state, { cutoff = CODEX_CUTOFF } = {}) {
 }
 
 async function run() {
-  const lock = acquireLock();
+  const lock = acquireLock(LOCK_FILE);
   if (lock === null) return;
   try {
     const state = loadState();
@@ -174,7 +143,7 @@ async function run() {
     state.last_run_at = new Date().toISOString();
     saveState(state);
   } finally {
-    releaseLock(lock);
+    releaseLock(LOCK_FILE, lock);
   }
 }
 

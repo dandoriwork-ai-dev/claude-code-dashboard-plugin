@@ -302,7 +302,7 @@ function pushSnapshot(stats, timestamp) {
   if (last && sig(last) === sig(snap)) return; // 何も増えていない
   // 同じ時刻（同じミリ秒）に終わった指示が続いたら、最後の累計 1 つにまとめる（v0.8.1）。
   // 行の id は時刻から作るので、2 つ送ると同じ id で別の累計が入り、画面がどちらを最終値に拾うかも決まらなかった
-  // （10/11 北原さんの 7/31 のセッション＝14 時刻・重複 25 行）
+  // （10/11 実測＝あるメンバーの 1 セッションで 14 時刻・重複 25 行）
   if (last && last.timestamp === snap.timestamp) stats.snapshots[stats.snapshots.length - 1] = snap;
   else stats.snapshots.push(snap);
 }

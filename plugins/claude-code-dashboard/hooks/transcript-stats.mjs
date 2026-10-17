@@ -171,7 +171,7 @@ export function addTranscriptEntry(stats, entry) {
 
 // ── 指示ごとのフォルダ（v0.7.0・2026-10-11）─────────────────────────────────
 // シェルの今いる場所（cwd）は「最後に cd した先」で、作業の場所とは限らない。ホームや記憶ファイルのフォルダに
-// いたまま絶対パスで案件のファイルを読み書きする使い方だと、案件が分からない（佐藤さん 30 日で 42%・10/11 実測）。
+// いたまま絶対パスで案件のファイルを読み書きする使い方だと、案件が分からない（あるメンバーは 30 日で 42%・10/11 実測）。
 // → Claude が読み書きしたファイルのフォルダを手がかりにする。送るのはフォルダのパスだけ（ファイル名・本文は送らない）。
 const PATH_INPUT = { Read: "file_path", Edit: "file_path", Write: "file_path", MultiEdit: "file_path", NotebookEdit: "notebook_path", Glob: "path", Grep: "path" };
 const DIR_INPUT = new Set(["Glob", "Grep"]); // path はフォルダのことが多いが、Grep はファイル 1 つも指せる
@@ -181,7 +181,7 @@ const NOT_A_PLACE = [/\/\.claude\//, /^\/(private\/)?tmp\//, /^\/(private\/)?var
 /**
  * 道具の入力から「触ったフォルダ」を返す。数えないもの（相対パス・置き場所・パスを持たない道具）は null。
  * Glob/Grep の path は pathKind で実物を確かめる＝ファイルならその親・見つからなければ数えない（v0.8.0。
- * v0.7.0 は path をそのままフォルダにしていたので、Grep でファイルを指すと workspace がファイル名になった・浦谷さん 10/11）。
+ * v0.7.0 は path をそのままフォルダにしていたので、Grep でファイルを指すと workspace がファイル名になった・10/11 指摘）。
  * pathKind が無ければ path そのもの
  */
 export function touchedFolder(toolName, toolInput, pathKind) {
