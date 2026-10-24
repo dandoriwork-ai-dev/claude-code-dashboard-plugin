@@ -16,7 +16,7 @@
  *          仕組みの資産（CLAUDE.md・rules 等）は asset-collector.mjs が、受け口が開いていて本人が承認したものだけを送る。
  */
 
-import { readFileSync, writeFileSync, appendFileSync, existsSync, unlinkSync, statSync } from "node:fs";
+import { readFileSync, writeFileSync, appendFileSync, existsSync, unlinkSync, statSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -26,7 +26,7 @@ import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 import {
   USAGE_METHOD, classifyTool, classifyToolKind,
-  createTranscriptStats, addTranscriptEntry, summarizeTranscriptStats,
+  createTranscriptStats, addTranscriptEntry, summarizeTranscriptStats, attributeSubagentUsage,
 } from "./transcript-stats.mjs";
 import {
   DASH_DIR, ensureDirs, logError, extractWorkspace, getUserEmail, codexHome, pathKind,
@@ -82,25 +82,64 @@ function clearBuffer() {
 
 // ── Transcript parsing ──────────────────────────────────────────────────────
 
-async function parseTranscript(transcriptPath, sessionId, cwd) {
-  if (!transcriptPath || !existsSync(transcriptPath)) return [];
-
-  const userEmail = getUserEmail();
-  const now = new Date().toISOString();
-
+// 1 ファイルを読んで集計する（本体・サブエージェント共通）
+async function readTranscriptStats(path) {
   const stats = createTranscriptStats({ pathKind }); // Glob/Grep の path がファイルかを実物で確かめる（v0.8.0）
-  const rl = createInterface({
-    input: createReadStream(transcriptPath, { encoding: "utf-8" }),
-    crlfDelay: Infinity,
-  });
-
+  const rl = createInterface({ input: createReadStream(path, { encoding: "utf-8" }), crlfDelay: Infinity });
   for await (const line of rl) {
     if (!line.trim()) continue;
     let entry;
     try { entry = JSON.parse(line); } catch { continue; }
     addTranscriptEntry(stats, entry);
   }
+  return stats;
+}
 
+// サブエージェントの記録（<session>/subagents/**/agent-*.jsonl）を読む（v0.9.1）。
+// 送るのはトークン・モデル・起動した道具の対応だけ（説明文・本文は読んでも送らない）。
+// 1 ファイルが壊れていても他は読む。サブエージェントが無いセッションは空
+async function readSubagents(transcriptPath) {
+  const root = join(transcriptPath.replace(/\.jsonl$/, ""), "subagents");
+  if (!existsSync(root)) return [];
+  const files = [];
+  const walk = (dir, inWorkflow) => {
+    for (const ent of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, ent.name);
+      if (ent.isDirectory()) walk(full, inWorkflow || ent.name === "workflows");
+      else if (/^agent-.+\.jsonl$/.test(ent.name)) files.push({ full, inWorkflow });
+    }
+  };
+  walk(root, false);
+  const agents = [];
+  for (const { full, inWorkflow } of files) {
+    try {
+      let meta = {};
+      const metaPath = full.replace(/\.jsonl$/, ".meta.json");
+      if (existsSync(metaPath)) meta = JSON.parse(readFileSync(metaPath, "utf-8"));
+      const summary = summarizeTranscriptStats(await readTranscriptStats(full));
+      agents.push({
+        agentId: full.split(/[\\/]/).pop().replace(/^agent-|\.jsonl$/g, ""),
+        toolUseId: meta.toolUseId, parentAgentId: meta.parentAgentId, agentType: meta.agentType,
+        inWorkflow, model: summary.model,
+        tokens: {
+          input_tokens: summary.input_tokens, output_tokens: summary.output_tokens,
+          cache_read_tokens: summary.cache_read_tokens, cache_creation_tokens: summary.cache_creation_tokens,
+        },
+      });
+    } catch (err) {
+      logError("subagent-parse", err);
+    }
+  }
+  return agents;
+}
+
+async function parseTranscript(transcriptPath, sessionId, cwd) {
+  if (!transcriptPath || !existsSync(transcriptPath)) return [];
+
+  const userEmail = getUserEmail();
+  const now = new Date().toISOString();
+
+  const stats = await readTranscriptStats(transcriptPath);
   const summary = summarizeTranscriptStats(stats, { home: homedir() });
   // 送る行のフォルダ＝直近の指示の中心（v0.6.0＝一番ツールを使ったフォルダ）。
   // 応答が終わった時点の cwd だと、最後に別フォルダへ移った指示の作業がまるごとそちらに付いた
@@ -112,6 +151,7 @@ async function parseTranscript(transcriptPath, sessionId, cwd) {
     model: summary.model, cwd: labelCwd, workspace: extractWorkspace(labelCwd),
     claude_code_version: summary.claude_code_version,
     plugin_version: PLUGIN_VERSION,
+    ...(summary.entrypoint && { entrypoint: summary.entrypoint }),
   };
 
   const events = [];
@@ -133,18 +173,31 @@ async function parseTranscript(transcriptPath, sessionId, cwd) {
     ...(summary.effort && { effort: summary.effort }),
   });
 
+  // サブエージェントのトークン（v0.9.1）＝起動した道具の行に載せる。session_summary の数字は変えない
+  const subagentUsage = attributeSubagentUsage(summary.toolKeyById, await readSubagents(transcriptPath));
+
   // Per-tool counts（種別ごとの累計。同じ Bash でも「確かめる」と「その他」は別の行）
-  for (const { event_type: eventType, event_name: eventName, tool_kind: toolKind, count } of summary.toolCounts.values()) {
+  const rows = new Map([...summary.toolCounts].map(([key, row]) => [key, { ...row }]));
+  // 起動した道具が本体に見当たらないサブエージェント（まれ）は回数 0 の行で載せる＝回数は変えない
+  for (const key of subagentUsage.keys()) {
+    if (!rows.has(key)) {
+      const [eventType, eventName, toolKind] = JSON.parse(key);
+      rows.set(key, { event_type: eventType, event_name: eventName, tool_kind: toolKind, count: 0 });
+    }
+  }
+  for (const [key, { event_type: eventType, event_name: eventName, tool_kind: toolKind, count }] of rows) {
+    const usage = subagentUsage.get(key);
     events.push({
       ...base,
       event_id: randomUUID(),
       event_type: eventType,
       event_name: eventName,
       tool_kind: toolKind,
-      input_tokens: 0,
-      output_tokens: 0,
-      cache_read_tokens: 0,
-      cache_creation_tokens: 0,
+      ...(usage && { model: usage.model }),
+      input_tokens: usage?.tokens.input_tokens || 0,
+      output_tokens: usage?.tokens.output_tokens || 0,
+      cache_read_tokens: usage?.tokens.cache_read_tokens || 0,
+      cache_creation_tokens: usage?.tokens.cache_creation_tokens || 0,
       message_count: 0,
       count,
     });

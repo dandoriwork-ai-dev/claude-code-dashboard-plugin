@@ -83,10 +83,17 @@ export function classifyBashCommand(command) {
   return "other";
 }
 
+// MCP のサーバー名（mcp__<サーバー>__<道具>）に playwright が入れば「確かめる」。
+// 名前は人が付ける（playwright-local・プラグイン経由の plugin_playwright_playwright 等）ので前方一致にしない（v0.9.1）
+const VERIFY_MCP_SERVER = /playwright/i;
+
 export function classifyToolKind(toolName, toolInput) {
   if (toolName === "Bash") return classifyBashCommand(toolInput?.command);
   if (KIND_BY_TOOL[toolName]) return KIND_BY_TOOL[toolName];
-  if (typeof toolName === "string" && toolName.startsWith("mcp__playwright__")) return "verify";
+  if (typeof toolName === "string" && toolName.startsWith("mcp__")) {
+    const server = toolName.slice("mcp__".length).split("__")[0];
+    if (VERIFY_MCP_SERVER.test(server)) return "verify";
+  }
   return "other";
 }
 
@@ -110,8 +117,10 @@ export function createTranscriptStats({ pathKind } = {}) {
     toolUseIds: new Set(),
     // 系列キー → { event_type, event_name, tool_kind, count }。名前に ":" が入る（plugin:skill）ので文字列を割らない
     toolCounts: new Map(),
+    toolKeyById: new Map(),    // tool_use の id → 系列キー（サブエージェントのトークンを起動した道具の行に載せる・v0.9.1）
     model: "unknown",
     ccVersion: "unknown",
+    entrypoint: null,          // 起動の入口（cli・sdk-cli＝claude -p 等）。記録に無い古い版は null（v0.9.1）
     hasOrigin: false,          // 人の発話の印（origin）を持つ版か。持たない古い版は発話数を「不明」で送る
     promptCount: 0,
     effortByMessage: new Map(), // 応答キー → effort
@@ -121,9 +130,15 @@ export function createTranscriptStats({ pathKind } = {}) {
   };
 }
 
+/** 道具の系列キー（event_type, event_name, tool_kind）。名前に ":" が入る（plugin:skill）ので JSON で持つ */
+export function toolRowKey(eventType, eventName, toolKind) {
+  return JSON.stringify([eventType, eventName, toolKind]);
+}
+
 export function addTranscriptEntry(stats, entry) {
   if (!entry || typeof entry !== "object") return;
   if (entry.version) stats.ccVersion = entry.version;
+  if (typeof entry.entrypoint === "string" && entry.entrypoint) stats.entrypoint = entry.entrypoint;
   if ("origin" in entry) stats.hasOrigin = true;
   if (isHumanPrompt(entry)) {
     if (entry.origin?.kind === "human") stats.promptCount++;
@@ -157,7 +172,8 @@ export function addTranscriptEntry(stats, entry) {
     }
     const c = classifyTool(block.name, block.input);
     const kind = classifyToolKind(block.name, block.input);
-    const toolKey = JSON.stringify([c.event_type, c.event_name, kind]);
+    const toolKey = toolRowKey(c.event_type, c.event_name, kind);
+    if (block.id) stats.toolKeyById.set(block.id, toolKey);
     const row = stats.toolCounts.get(toolKey) || { event_type: c.event_type, event_name: c.event_name, tool_kind: kind, count: 0 };
     row.count++;
     stats.toolCounts.set(toolKey, row);
@@ -260,7 +276,9 @@ export function summarizeTranscriptStats(stats, { home } = {}) {
     message_count: stats.usageByMessage.size,
     model: stats.model,
     claude_code_version: stats.ccVersion,
+    entrypoint: stats.entrypoint,
     toolCounts: stats.toolCounts,
+    toolKeyById: stats.toolKeyById,
     // 人の発話数。印の無い古い版は null（推測で数えない）
     prompt_count: stats.hasOrigin ? stats.promptCount : null,
     // 応答ごとの effort で一番多かったもの。無ければ null
@@ -269,4 +287,50 @@ export function summarizeTranscriptStats(stats, { home } = {}) {
     // 同数なら先に使った方。どちらも無ければ null＝呼び出し側の cwd を使う
     turnCwd: turnFolderOf(stats.turnCwdCounts, stats.turnTouchCounts, home),
   };
+}
+
+// ── サブエージェントのトークン（v0.9.1・2026-10-25）─────────────────────────────
+// サブエージェント（Agent・Workflow の子）の記録は本体とは別のファイル（<session>/subagents/**/agent-*.jsonl）にあり、
+// 本体の usage には入っていない＝本体だけ読むと、任せる人ほど少なく見える（あるメンバーの手元で本体の 2 割強）。
+// → 起動した道具の行（subagent の Explore・Workflow 等）にトークンとモデルを載せる。session_summary の数字は変えない
+//   （今の画面の金額はそのまま・サブエージェント分は別に足せる）。行の model はその行で一番トークンを使ったモデル。
+
+/**
+ * サブエージェントを起動した道具の系列キーに割り当てる（純関数）。
+ * agents: [{ agentId, toolUseId, parentAgentId, agentType, inWorkflow, model, tokens: {input_tokens, …} }]
+ * 決め方: ①toolUseId が本体の tool_use ②親のサブエージェント（parentAgentId）の割り当て先
+ *         ③Workflow の子（toolUseId を持たない）＝Workflow の行 ④どれも無ければ agentType の subagent 行
+ * 返り値: Map(系列キー → { tokens, model })
+ */
+export function attributeSubagentUsage(toolKeyById, agents) {
+  const byId = new Map(agents.filter((a) => a.agentId).map((a) => [a.agentId, a]));
+  const workflow = classifyTool("Workflow", {});
+  const workflowKey = toolRowKey(workflow.event_type, workflow.event_name, classifyToolKind("Workflow", {}));
+  const keyOf = (agent, seen = new Set()) => {
+    if (agent.toolUseId && toolKeyById.has(agent.toolUseId)) return toolKeyById.get(agent.toolUseId);
+    const parent = agent.parentAgentId && byId.get(agent.parentAgentId);
+    if (parent && !seen.has(parent.agentId)) return keyOf(parent, new Set([...seen, agent.agentId]));
+    if (agent.inWorkflow) return workflowKey;
+    return toolRowKey("subagent", agent.agentType || "general-purpose", classifyToolKind("Agent", {}));
+  };
+  const rows = new Map(); // キー → { tokens, byModel: Map(model → 合計) }
+  for (const agent of agents) {
+    const key = keyOf(agent);
+    const row = rows.get(key) || { tokens: Object.fromEntries(Object.values(USAGE_FIELDS).map((c) => [c, 0])), byModel: new Map() };
+    let total = 0;
+    for (const col of Object.values(USAGE_FIELDS)) {
+      const n = agent.tokens?.[col] || 0;
+      row.tokens[col] += n;
+      total += n;
+    }
+    if (agent.model && agent.model !== "unknown") row.byModel.set(agent.model, (row.byModel.get(agent.model) || 0) + total);
+    rows.set(key, row);
+  }
+  const out = new Map();
+  for (const [key, { tokens, byModel }] of rows) {
+    let model = "unknown", best = -1;
+    for (const [m, n] of byModel) if (n > best) { model = m; best = n; }
+    out.set(key, { tokens, model });
+  }
+  return out;
 }

@@ -46,7 +46,8 @@ export CLAUDE_DASH_USER_EMAIL="you@company.com"
 ### What is collected (metadata only)
 
 - ツール種別・名前・回数（Skill, Subagent, external tools）
-- モデル名、トークン数
+- モデル名、トークン数（v0.9.1〜 サブエージェント・Workflow の子の分も、起動した道具ごとに）
+- 起動の入口（v0.9.1〜・人が開いた画面か `claude -p` 等の自動実行か）
 - セッションID、作業フォルダのパスとワークスペース名
 - Codex（v0.8.0〜）も同じ項目（tool=codex）：モデル名・トークン数・指示の数・道具の種別と回数・作業フォルダのパス
 - ユーザーメール（git config）
