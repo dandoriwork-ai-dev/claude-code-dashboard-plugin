@@ -29,18 +29,12 @@ export CLAUDE_DASH_API_KEY="<管理者から共有されたAPIキーを設定>"
 export CLAUDE_DASH_USER_EMAIL="you@company.com"
 ```
 
-## Directory Convention
+## 計測するフォルダ
 
-計測対象は `~/work/company/` 配下のリポジトリのみです。
-会社リポジトリをこの配下に置いてください（移動 or 再clone）。
+すべてのフォルダでの作業を計測します（2026-03 以降。`~/work/company/` などに置き直す必要はありません）。
+フォルダについて送るのはパスとワークスペース名（git のリポジトリ名、なければフォルダ名）だけで、ファイル名・本文は送りません。
 
-```bash
-mkdir -p ~/work/company
-cd ~/work/company
-git clone git@github.com:your-org/your-repo.git
-```
-
-`~/work/company/` 以外で Claude Code を使っても計測されません（プライバシー保護）。
+`.dash-private`（フォルダ）・`/dash-private`（セッション）で止まるのは中身（仕組みの資産・学びの要約）だけで、使った量と型は今まで通り数えます。
 
 ## How It Works
 
@@ -96,7 +90,7 @@ rm -rf ~/.claude/claude-dash/
 | イベントが送信されない | `CLAUDE_DASH_INGEST_URL` と `CLAUDE_DASH_API_KEY` が設定されているか確認 |
 | `error.log` に `stdin timeout` | Claude Code のバージョンが古い可能性。最新版にアップデート |
 | `failed/` にファイルが溜まる | ネットワーク問題。次回セッション終了時に自動リトライされます |
-| 計測されていない | `~/work/company/` 配下で作業しているか確認 |
+| 計測されていない | `ls ~/.claude/claude-dash/failed/` に溜まっていないか・`error.log` を確認。プラグインを更新したら Claude Code を全部終了して開き直す（開いたままのセッションは古い版のまま） |
 
 ## API Key Rotation
 
